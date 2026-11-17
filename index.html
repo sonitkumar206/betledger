@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BetLedger</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen antialiased">
+  <div id="app"></div>
+  <script>
+    const SUPABASE_URL = "https://njzenabzfnbghufrkequ.supabase.co";
+    const KEY_STORAGE = "betledger_supabase_anon_key";
+    const TOKEN_STORAGE = "betledger_auth_token";
+
+    let sb = null;
+    let state = {
+      authed: Boolean(sessionStorage.getItem(TOKEN_STORAGE)),
+      anonKey: localStorage.getItem(KEY_STORAGE) || "",
+      tab: "bets",
+      bets: [],
+      baselines: [],
+      imports: [],
+      filterStatus: "All",
+      search: "",
+      loading: false,
+      error: "",
+      showBetModal: false,
+      editingBet: null,
+      showKeyModal: false
+    };
+
+    function initSupabase() {
+      if (state.anonKey) {
+        sb = window.supabase.createClient(SUPABASE_URL, state.anonKey);
+      } else {
+        sb = null;
+      }
+    }
+
+    function fmtMoney(n) {
+      const val = Number(n || 0);
+      const sign = val < 0 ? "-" : "";
+      return sign + "$" + Math.abs(val).toFixed(2);
+    }
+
+    function calcProfit(b) {
+      const stake = Number(b.stake || 0);
+      const odds = Number(b.total_odds || 1);
+      const st = (b.status || "").toLowerCase();
+      if (st === "won") return stake * (odds - 1);
+      if (st === "lost") return -stake;
+      if (st === "cashed out" || st === "cashed_out") return Number(b.cash_out_amount || 0) - stake;
+      return 0;
+    }
+
+    async function loadData() {
+      if (!sb) { state.showKeyModal = true; render(); return; }
+      state.loading = true;
+      state.error = "";
+      render();
+      try {
+        const [bRes, mRes, iRes] = await Promise.all([
+          sb.from("bets").select("*").order("id", { ascending: false }),
+          sb.from("monthly_baselines").select("*").order("month", { ascending: false }),
+          sb.from("bet_imports").select("*").order("id", { ascending: false })
+        ]);
+        if (bRes.error) throw bRes.error;
+        if (mRes.error) throw mRes.error;
+        if (iRes.error) throw iRes.error;
+        state.bets = bRes.data || [];
+        state.baselines = mRes.data || [];
+        state.imports = iRes.data || [];
+      } catch (err) {
+        state.error = err.message || "Failed to load Supabase data";
+      } finally {
+        state.loading = false;
+        render();
+      }
+    }
+
+    async function handleLogin(e) {
+      e.preventDefault();
+      const pw = document.getElementById("pw-input").value;
+      const errEl = document.getElementById("login-err");
+      errEl.textContent = "";
+      try {
+        const res = await fetch("/api/auth", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ password: pw })
+        });
+        const data = await res.json();
+        if (!res.ok) { errEl.textContent = data.message || "Incorrect password"; return; }
+        sessionStorage.setItem(TOKEN_STORAGE, data.token);
+        state.authed = true;
+        initSupabase();
+        await loadData();
+      } catch {
+        errEl.textContent = "Unable to reach /api/auth";
+      }
+    }
+
+    function saveKey(e) {
+      e.preventDefault();
+      const key = document.getElementById("sb-key-input").value.trim();
+      if (!key) return;
+      localStorage.setItem(KEY_STORAGE, key);
+      state.anonKey = key;
+      state.showKeyModal = false;
+      initSupabase();
+      loadData();
+    }
+
+    async function saveBet(e) {
+      e.preventDefault();
+      const f = e.target;
+      const payload = {
+        bet_name: f.bet_name.value.trim(),
+        bookmaker: f.bookmaker.value.trim(),
+        bet_category: f.bet_category.value.trim(),
+        event_date: f.event_date.value.trim(),
+        kickoff_time: f.kickoff_time.value.trim(),
+        stake: parseFloat(f.stake.value || "0"),
+        funding_type: f.funding_type.value.trim() || "Cash",
+        total_odds: parseFloat(f.total_odds.value || "1"),
+        status: f.status.value,
+        cash_out_amount: f.cash_out_amount.value ? parseFloat(f.cash_out_amount.value) : null,
+        legs: f.legs.value.trim(),
+        notes: f.notes.value.trim()
+      };
+      if (state.editingBet) {
+        await sb.from("bets").update(payload).eq("id", state.editingBet.id);
+      } else {
+        payload.created_at = new Date().toISOString();
+        await sb.from("bets").insert(payload);
+      }
+      state.showBetModal = false;
+      state.editingBet = null;
+      await loadData();
+    }
+
+    async function quickStatus(id, status) {
+      await sb.from("bets").update({ status }).eq("id", id);
+      await loadData();
+    }
+
+    async function deleteBet(id) {
+      if (!confirm("Delete this bet?")) return;
+      await sb.from("bets").delete().eq("id", id);
+      await loadData();
+    }
+
+    async function saveBaseline(e) {
+      e.preventDefault();
+      const f = e.target;
+      const payload = {
+        month: f.month.value.trim(),
+        net_amount: parseFloat(f.net_amount.value || "0"),
+        label: f.label.value.trim(),
+        includes_current_bets: f.includes_current_bets.checked
+      };
+      await sb.from("monthly_baselines").upsert(payload, { onConflict: "month" });
+      f.reset();
+      await loadData();
+    }
+
+    async function saveImport(e) {
+      e.preventDefault();
+      const f = e.target;
+      await sb.from("bet_imports").insert({
+        bookmaker: f.bookmaker.value.trim(),
+        text_content: f.text_content.value.trim(),
+        note: f.note.value.trim(),
+        status: "pending"
+      });
+      f.reset();
+      await loadData();
+    }
+
+    function escapeHtml(s) {
+      return String(s ?? "").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+    }
+
+    function render() {
+      const root = document.getElementById("app");
+      if (!state.authed) {
+        root.innerHTML = `
+          <div class="min-h-screen flex items-center justify-center p-4">
+            <form onsubmit="handleLogin(event)" class="w-full max-w-sm bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-4">
+              <h1 class="text-xl font-semibold">Protected site</h1>
+              <p class="text-sm text-slate-400">This is a private instance. Enter the password to continue.</p>
+              <input id="pw-input" type="password" placeholder="Password" required autofocus class="w-full px-3 py-2 rounded-lg bg-slate-950 border border-slate-700 focus:outline-none focus:border-emerald-500" />
+              <p id="login-err" class="text-sm text-rose-400"></p>
+              <button type="submit" class="w-full py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 font-medium">Continue</button>
+            </form>
+          </div>`;
+        return;
+      }
+
+      const settled = state.bets.filter(b => ["won","lost","cashed out","cashed_out"].includes((b.status||"").toLowerCase()));
+      const totalStaked = state.bets.reduce((a, b) => a + Number(b.stake || 0), 0);
+      const netProfit = settled.reduce((a, b) => a + calcProfit(b), 0);
+      const settledStaked = settled.reduce((a, b) => a + Number(b.stake || 0), 0);
+      const roi = settledStaked > 0 ? (netProfit / settledStaked) * 100 : 0;
+      const wonCount = settled.filter(b => (b.status||"").toLowerCase() === "won").length;
+      const winRate = settled.length > 0 ? (wonCount / settled.length) * 100 : 0;
+      const pendingStake = state.bets.filter(b => (b.status||"").toLowerCase() === "pending").reduce((a, b) => a + Number(b.stake || 0), 0);
+
+      const filtered = state.bets.filter(b => {
+        const stOk = state.filterStatus === "All" || (b.status || "").toLowerCase() === state.filterStatus.toLowerCase();
+        const q = state.search.toLowerCase();
+        const qOk = !q || [b.bet_name, b.bookmaker, b.bet_category, b.legs, b.notes].some(v => (v || "").toLowerCase().includes(q));
+        return stOk && qOk;
+      });
+
+      root.innerHTML = `
+        <header class="border-b border-slate-800 bg-slate-900/70 sticky top-0 z-10 backdrop-blur">
+          <div class="max-w-6xl mx-auto px-4 py-3 flex flex-wrap items-center justify-between gap-3">
+            <div class="flex items-center gap-4">
+              <span class="text-lg font-bold text-emerald-400">BetLedger</span>
+              <nav class="flex gap-1 text-sm">
+                ${["bets","baselines","imports"].map(t => `
+                  <button onclick="state.tab='${t}';render()" class="px-3 py-1.5 rounded-lg capitalize ${state.tab===t ? 'bg-slate-800 text-white' : 'text-slate-400 hover:text-white'}">${t}</button>
+                `).join("")}
+              </nav>
+            </div>
+            <div class="flex items-center gap-2">
+              <button onclick="state.showKeyModal=true;render()" class="px-3 py-1.5 text-xs rounded-lg border border-slate-700 text-slate-300 hover:bg-slate-800">Supabase Key</button>
+              <button onclick="state.editingBet=null;state.showBetModal=true;render()" class="px-3 py-1.5 text-sm rounded-lg bg-emerald-600 hover:bg-emerald-500 font-medium">+ New Bet</button>
+            </div>
+          </div>
+        </header>
+
+        <main class="max-w-6xl mx-auto px-4 py-6 space-y-6">
+          ${state.error ? `<div class="p-3 rounded-lg bg-rose-950/60 border border-rose-800 text-rose-200 text-sm">${escapeHtml(state.error)}</div>` : ""}
+
+          <section class="grid grid-cols-2 md:grid-cols-5 gap-3">
+            <div class="bg-slate-900 border border-slate-800 rounded-xl p-4"><div class="text-xs text-slate-400">Net P&amp;L</div><div class="text-xl font-bold ${netProfit>=0?'text-emerald-400':'text-rose-400'}">${fmtMoney(netProfit)}</div></div>
+            <div class="bg-slate-900 border border-slate-800 rounded-xl p-4"><div class="text-xs text-slate-400">ROI</div><div class="text-xl font-bold">${roi.toFixed(1)}%</div></div>
+            <div class="bg-slate-900 border border-slate-800 rounded-xl p-4"><div class="text-xs text-slate-400">Win Rate</div><div class="text-xl font-bold">${winRate.toFixed(1)}%</div></div>
+            <div class="bg-slate-900 border border-slate-800 rounded-xl p-4"><div class="text-xs text-slate-400">Total Staked</div><div class="text-xl font-bold">${fmtMoney(totalStaked)}</div></div>
+            <div class="bg-slate-900 border border-slate-800 rounded-xl p-4"><div class="text-xs text-slate-400">Pending</div><div class="text-xl font-bold text-amber-400">${fmtMoney(pendingStake)}</div></div>
+          </section>
+
+          ${state.tab === "bets" ? `
+            <section class="space-y-3">
+              <div class="flex flex-wrap gap-2 items-center justify-between">
+                <div class="flex flex-wrap gap-1.5">
+                  ${["All","Pending","Won","Lost","Cashed Out","Void"].map(s => `
+                    <button onclick="state.filterStatus='${s}';render()" class="px-3 py-1 rounded-lg text-xs border ${state.filterStatus===s?'bg-emerald-600 border-emerald-500 text-white':'border-slate-800 bg-slate-900 text-slate-300'}">${s}</button>
+                  `).join("")}
+                </div>
+                <input value="${escapeHtml(state.search)}" oninput="state.search=this.value;render()" placeholder="Search bets, bookmaker, legs..." class="px-3 py-1.5 text-sm rounded-lg bg-slate-900 border border-slate-800 w-64" />
+              </div>
+
+              <div class="overflow-x-auto bg-slate-900 border border-slate-800 rounded-xl">
+                <table class="w-full text-sm text-left">
+                  <thead class="text-xs text-slate-400 border-b border-slate-800">
+                    <tr>
+                      <th class="p-3">Bet</th><th class="p-3">Bookmaker</th><th class="p-3">Date</th>
+                      <th class="p-3">Stake</th><th class="p-3">Odds</th><th class="p-3">Status</th><th class="p-3">P&amp;L</th><th class="p-3 text-right">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody class="divide-y divide-slate-800/70">
+                    ${filtered.map(b => {
+                      const pnl = calcProfit(b);
+                      return `
+                        <tr class="hover:bg-slate-800/40">
+                          <td class="p-3">
+                            <div class="font-medium">${escapeHtml(b.bet_name || "Untitled")}</div>
+                            ${b.legs ? `<div class="text-xs text-slate-400 max-w-xs truncate">${escapeHtml(b.legs)}</div>` : ""}
+                          </td>
+                          <td class="p-3 text-slate-300">${escapeHtml(b.bookmaker)} <span class="text-xs text-slate-500">${escapeHtml(b.bet_category)}</span></td>
+                          <td class="p-3 text-slate-400 text-xs">${escapeHtml(b.event_date)} ${escapeHtml(b.kickoff_time)}</td>
+                          <td class="p-3">${fmtMoney(b.stake)}</td>
+                          <td class="p-3">${Number(b.total_odds || 0).toFixed(2)}</td>
+                          <td class="p-3">
+                            <select onchange="quickStatus(${b.id}, this.value)" class="bg-slate-950 border border-slate-700 rounded px-2 py-1 text-xs">
+                              ${["Pending","Won","Lost","Cashed Out","Void"].map(opt => `<option ${((b.status||"").toLowerCase()===opt.toLowerCase())?"selected":""}>${opt}</option>`).join("")}
+                            </select>
+                          </td>
+                          <td class="p-3 font-medium ${pnl>0?'text-emerald-400':pnl<0?'text-rose-400':'text-slate-400'}">${fmtMoney(pnl)}</td>
+                          <td class="p-3 text-right space-x-2">
+                            <button onclick='state.editingBet=${JSON.stringify(b).replace(/'/g,"&#39;")};state.showBetModal=true;render()' class="text-xs text-sky-400 hover:underline">Edit</button>
+                            <button onclick="deleteBet(${b.id})" class="text-xs text-rose-400 hover:underline">Delete</button>
+                          </td>
+                        </tr>`;
+                    }).join("") || `<tr><td colspan="8" class="p-6 text-center text-slate-500">${state.loading ? "Loading..." : "No bets found"}</td></tr>`}
+                  </tbody>
+                </table>
+              </div>
+            </section>
+          ` : state.tab === "baselines" ? `
+            <section class="grid md:grid-cols-3 gap-4">
+              <form onsubmit="saveBaseline(event)" class="bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-3">
+                <h2 class="font-semibold">Add / Update Monthly Baseline</h2>
+                <input name="month" placeholder="YYYY-MM (e.g. 2026-11)" required class="w-full px-3 py-2 text-sm rounded bg-slate-950 border border-slate-800" />
+                <input name="net_amount" type="number" step="0.01" placeholder="Net Amount" required class="w-full px-3 py-2 text-sm rounded bg-slate-950 border border-slate-800" />
+                <input name="label" placeholder="Label" class="w-full px-3 py-2 text-sm rounded bg-slate-950 border border-slate-800" />
+                <label class="flex items-center gap-2 text-sm text-slate-300"><input name="includes_current_bets" type="checkbox" /> Includes current bets</label>
+                <button class="w-full py-2 rounded bg-emerald-600 hover:bg-emerald-500 text-sm font-medium">Save Baseline</button>
+              </form>
+              <div class="md:col-span-2 bg-slate-900 border border-slate-800 rounded-xl overflow-hidden">
+                <table class="w-full text-sm text-left">
+                  <thead class="text-xs text-slate-400 border-b border-slate-800"><tr><th class="p-3">Month</th><th class="p-3">Label</th><th class="p-3">Net Amount</th><th class="p-3">Includes Current</th></tr></thead>
+                  <tbody class="divide-y divide-slate-800">
+                    ${state.baselines.map(m => `<tr><td class="p-3 font-medium">${escapeHtml(m.month)}</td><td class="p-3 text-slate-300">${escapeHtml(m.label)}</td><td class="p-3">${fmtMoney(m.net_amount)}</td><td class="p-3">${m.includes_current_bets ? "Yes" : "No"}</td></tr>`).join("") || `<tr><td colspan="4" class="p-6 text-center text-slate-500">No baselines</td></tr>`}
+                  </tbody>
+                </table>
+              </div>
+            </section>
+          ` : `
+            <section class="grid md:grid-cols-3 gap-4">
+              <form onsubmit="saveImport(event)" class="bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-3">
+                <h2 class="font-semibold">Queue Bet Import</h2>
+                <input name="bookmaker" placeholder="Bookmaker" class="w-full px-3 py-2 text-sm rounded bg-slate-950 border border-slate-800" />
+                <textarea name="text_content" rows="4" placeholder="Paste slip text..." required class="w-full px-3 py-2 text-sm rounded bg-slate-950 border border-slate-800"></textarea>
+                <input name="note" placeholder="Note" class="w-full px-3 py-2 text-sm rounded bg-slate-950 border border-slate-800" />
+                <button class="w-full py-2 rounded bg-emerald-600 hover:bg-emerald-500 text-sm font-medium">Save Import</button>
+              </form>
+              <div class="md:col-span-2 space-y-2">
+                ${state.imports.map(i => `
+                  <div class="bg-slate-900 border border-slate-800 rounded-xl p-3 text-sm">
+                    <div class="flex justify-between text-xs text-slate-400 mb-1"><span>${escapeHtml(i.bookmaker || "Unknown")} · ${escapeHtml(i.status)}</span><span>${escapeHtml(i.created_at)}</span></div>
+                    <div class="text-slate-200 whitespace-pre-wrap">${escapeHtml(i.text_content || i.note)}</div>
+                  </div>
+                `).join("") || `<div class="bg-slate-900 border border-slate-800 rounded-xl p-6 text-center text-slate-500 text-sm">No imports</div>`}
+              </div>
+            </section>
+          `}
+        </main>
+
+        ${state.showBetModal ? `
+          <div class="fixed inset-0 bg-black/70 flex items-center justify-center p-4 z-50">
+            <form onsubmit="saveBet(event)" class="w-full max-w-lg bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-3 max-h-[90vh] overflow-y-auto">
+              <div class="flex justify-between items-center"><h2 class="font-semibold">${state.editingBet ? "Edit Bet" : "New Bet"}</h2><button type="button" onclick="state.showBetModal=false;render()" class="text-slate-400">✕</button></div>
+              <div class="grid grid-cols-2 gap-2 text-sm">
+                <input name="bet_name" value="${escapeHtml(state.editingBet?.bet_name)}" placeholder="Bet Name" required class="col-span-2 px-3 py-2 rounded bg-slate-950 border border-slate-800" />
+                <input name="bookmaker" value="${escapeHtml(state.editingBet?.bookmaker)}" placeholder="Bookmaker" class="px-3 py-2 rounded bg-slate-950 border border-slate-800" />
+                <input name="bet_category" value="${escapeHtml(state.editingBet?.bet_category)}" placeholder="Category (e.g. UFC)" class="px-3 py-2 rounded bg-slate-950 border border-slate-800" />
+                <input name="event_date" value="${escapeHtml(state.editingBet?.event_date)}" placeholder="Event Date (YYYY-MM-DD)" class="px-3 py-2 rounded bg-slate-950 border border-slate-800" />
+                <input name="kickoff_time" value="${escapeHtml(state.editingBet?.kickoff_time)}" placeholder="Kickoff Time" class="px-3 py-2 rounded bg-slate-950 border border-slate-800" />
+                <input name="stake" type="number" step="0.01" value="${escapeHtml(state.editingBet?.stake)}" placeholder="Stake" required class="px-3 py-2 rounded bg-slate-950 border border-slate-800" />
+                <input name="total_odds" type="number" step="0.01" value="${escapeHtml(state.editingBet?.total_odds)}" placeholder="Total Odds" required class="px-3 py-2 rounded bg-slate-950 border border-slate-800" />
+                <input name="funding_type" value="${escapeHtml(state.editingBet?.funding_type || 'Cash')}" placeholder="Funding Type" class="px-3 py-2 rounded bg-slate-950 border border-slate-800" />
+                <select name="status" class="px-3 py-2 rounded bg-slate-950 border border-slate-800">
+                  ${["Pending","Won","Lost","Cashed Out","Void"].map(opt => `<option ${(state.editingBet?.status||"Pending").toLowerCase()===opt.toLowerCase()?"selected":""}>${opt}</option>`).join("")}
+                </select>
+                <input name="cash_out_amount" type="number" step="0.01" value="${escapeHtml(state.editingBet?.cash_out_amount)}" placeholder="Cash Out Amount (optional)" class="col-span-2 px-3 py-2 rounded bg-slate-950 border border-slate-800" />
+                <textarea name="legs" rows="2" placeholder="Legs" class="col-span-2 px-3 py-2 rounded bg-slate-950 border border-slate-800">${escapeHtml(state.editingBet?.legs)}</textarea>
+                <textarea name="notes" rows="2" placeholder="Notes" class="col-span-2 px-3 py-2 rounded bg-slate-950 border border-slate-800">${escapeHtml(state.editingBet?.notes)}</textarea>
+              </div>
+              <button class="w-full py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 font-medium text-sm">Save Bet</button>
+            </form>
+          </div>
+        ` : ""}
+
+        ${state.showKeyModal ? `
+          <div class="fixed inset-0 bg-black/70 flex items-center justify-center p-4 z-50">
+            <form onsubmit="saveKey(event)" class="w-full max-w-md bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-3">
+              <div class="flex justify-between items-center"><h2 class="font-semibold">Supabase Anon Key</h2><button type="button" onclick="state.showKeyModal=false;render()" class="text-slate-400">✕</button></div>
+              <p class="text-xs text-slate-400">Enter your Supabase <code>bet-ledger</code> project anon/publishable key (stored locally in your browser).</p>
+              <input id="sb-key-input" value="${escapeHtml(state.anonKey)}" placeholder="eyJ..." required class="w-full px-3 py-2 text-sm rounded bg-slate-950 border border-slate-800" />
+              <button class="w-full py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 font-medium text-sm">Save &amp; Connect</button>
+            </form>
+          </div>
+        ` : ""}
+      `;
+    }
+
+    initSupabase();
+    render();
+    if (state.authed && sb) loadData();
+  </script>
+</body>
+</html>
